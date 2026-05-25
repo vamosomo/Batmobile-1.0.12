@@ -23,6 +23,13 @@ local navigator = {
     spell_time = -1,
     spell_timeout = 0.15,
     warlock_alt = false,  -- toggles between WS and DS each cast attempt
+    -- Whirlwind (barbarian, spell 206435) channel state. Registered once via
+    -- cast_spell.add_channel_spell; position is only re-sent when path[1]
+    -- drifts beyond WHIRLWIND_REPOS_DIST to avoid restarting the channel
+    -- every tick (root cause of past stutter). Fully separate from the
+    -- legacy move-spell pipeline.
+    whirlwind_channel_active  = false,
+    whirlwind_last_target_pos = nil,
     blacklisted_spell_node = {},
     unstuck_nodes = {},
     unstuck_count = 0,
@@ -358,6 +365,380 @@ local function try_traversal_route(local_player, player_pos)
     navigator.path = {}
     navigator.pathfind_fail_count = 0
     return true, closest_trav
+end
+-- Whirlwind (Barbarian, spell 206435).
+-- Walking-style channeled mover: the character keeps walking the normal path
+-- via pathfinder.request_move; Whirlwind is registered as a channel spell so
+-- the engine handles continuous casting at the configured interval. We just
+-- update the channel's target position each tick to follow path[1]. This
+-- function is intentionally self-contained — it does not touch navigator.path,
+-- last_pos, blacklisted_spell_node, move_spell_resume_time, or any other
+-- shared movement state.
+local WHIRLWIND_SPELL_ID  = 206435
+local WHIRLWIND_FINISH    = 3600.0  -- seconds; set once, long horizon
+-- Reposition gate: push update_channel_spell_position when target has
+-- drifted this far. 8y left the target stale behind the player as they
+-- walked (channel whirling backward, actively fighting forward walking).
+-- 3y keeps it current while still throttling updates enough to avoid the
+-- per-tick input contention we saw at <2y.
+local WHIRLWIND_REPOS_DIST = 3.0
+-- Verbose logger for whirlwind tuning: prints regardless of settings.debug_logs
+-- so we can diagnose the no-movement issue without toggling debug mode.
+local function wlog(msg) console.print('[whirlwind] ' .. msg) end
+-- External-plugin yield: when another WarPig-suite plugin is in a click-driven
+-- task (loot pickup, altar/chest interact, shrine, etc.) the channel cast
+-- spam competes with their single-click interactions and freezes the bot.
+-- Each plugin exposes status via a global; we pcall-probe so missing plugins
+-- don't error. Returns reason string when busy, nil otherwise.
+local WHIRLWIND_REAPER_BLOCK_TASKS = {
+    -- ReaperPlugin.status().task is a TABLE { name = "..." } — match against
+    -- task.name. Names are the human-readable strings set in each task file
+    -- (see Reaper-main/tasks/*.lua), NOT snake_case file names.
+    ["Interact Altar"]       = true,
+    ["Open Chest"]           = true,
+    ["Belial Chest Looter"]  = true,
+}
+local WHIRLWIND_HORDE_BLOCK_STATES = {
+    -- InfernalHordesPlugin.getState() — see HordeDev/main.lua#getState
+    INTERACTING_PYLON = true,
+    OPENING_CHESTS    = true,
+}
+local WHIRLWIND_HELLTIDE_BLOCK_STATES = {
+    -- HelltideRevampedPlugin.getState() returns helltide_task.current_state.
+    -- Includes interact-active states AND MOVING_TO_* states that call
+    -- interact_object on arrival within the same state (chests / ore / herb
+    -- / shrine all interact in-state, while pyre / chaos_rift / maiden have
+    -- dedicated INTERACT_* states which are blocked instead).
+    INTERACT_PYRE              = true,
+    INTERACT_CHAOS_RIFT        = true,
+    AT_MAIDEN                  = true,
+    STAY_NEAR_PYRE             = true,
+    STAY_NEAR_CHAOS_RIFT       = true,
+    FARM_CHEST_CINDERS         = true,
+    MOVING_TO_HELLTIDE_CHEST   = true,
+    MOVING_TO_SILENT_CHEST     = true,
+    MOVING_TO_REMEMBERED_CHEST = true,
+    MOVING_TO_ORE              = true,
+    MOVING_TO_HERB             = true,
+    MOVING_TO_SHRINE           = true,
+}
+local function whirlwind_external_busy()
+    -- Looteer: flag-based ("looting" while item pickup is in progress)
+    if type(_G.LooteerPlugin) == 'table'
+        and type(LooteerPlugin.getSettings) == 'function'
+    then
+        local ok, v = pcall(LooteerPlugin.getSettings, 'looting')
+        if ok and v then return 'looteer_active' end
+    end
+    -- Reaper: status().task is a TABLE { name = "..." }; match task.name
+    if type(_G.ReaperPlugin) == 'table'
+        and type(ReaperPlugin.status) == 'function'
+    then
+        local ok, st = pcall(ReaperPlugin.status)
+        if ok and type(st) == 'table' and st.enabled
+            and type(st.task) == 'table'
+            and WHIRLWIND_REAPER_BLOCK_TASKS[st.task.name]
+        then
+            return 'reaper_' .. tostring(st.task.name)
+        end
+    end
+    -- InfernalHordes: getState() reads task_manager.get_current_task(),
+    -- which holds a STALE task object from the previous run after the
+    -- plugin's main toggle flips off, returning a frozen state forever.
+    -- Gate on status().enabled to ignore stale state.
+    if type(_G.InfernalHordesPlugin) == 'table'
+        and type(InfernalHordesPlugin.getState) == 'function'
+        and type(InfernalHordesPlugin.status) == 'function'
+    then
+        local sok, st = pcall(InfernalHordesPlugin.status)
+        if sok and type(st) == 'table' and st.enabled then
+            local ok, s = pcall(InfernalHordesPlugin.getState)
+            if ok and WHIRLWIND_HORDE_BLOCK_STATES[s] then
+                return 'horde_' .. tostring(s)
+            end
+        end
+    end
+    -- HelltideRevamped: same staleness risk — when HR main toggle flips off
+    -- (e.g. WarPigs hands off to WonderCity / Reaper), task_manager still
+    -- holds the frozen helltide task and getState() keeps returning its old
+    -- state (observed: helltide_MOVING_TO_HELLTIDE_CHEST while player is in
+    -- Undercity). Gate on status().enabled.
+    if type(_G.HelltideRevampedPlugin) == 'table'
+        and type(HelltideRevampedPlugin.getState) == 'function'
+        and type(HelltideRevampedPlugin.status) == 'function'
+    then
+        local sok, st = pcall(HelltideRevampedPlugin.status)
+        if sok and type(st) == 'table' and st.enabled then
+            local ok, s = pcall(HelltideRevampedPlugin.getState)
+            if ok and WHIRLWIND_HELLTIDE_BLOCK_STATES[s] then
+                return 'helltide_' .. tostring(s)
+            end
+        end
+    end
+    -- ArkhamAsylum: get_status().task is "Current Task: <name> (<status>)";
+    -- use substring match on the interact tasks we care about.
+    if type(_G.ArkhamAsylumPlugin) == 'table'
+        and type(ArkhamAsylumPlugin.get_status) == 'function'
+    then
+        local ok, st = pcall(ArkhamAsylumPlugin.get_status)
+        if ok and type(st) == 'table' and st.enabled
+            and type(st.task) == 'string'
+            and st.task:find('interact_shrine', 1, true)
+        then
+            return 'arkham_interact_shrine'
+        end
+    end
+    return nil
+end
+local function whirlwind_teardown(reason)
+    if navigator.whirlwind_channel_active then
+        local ok, err = pcall(cast_spell.remove_channel_spell, WHIRLWIND_SPELL_ID)
+        navigator.whirlwind_channel_active  = false
+        navigator.whirlwind_last_target_pos = nil
+        navigator.whirlwind_last_player_pos = nil
+        navigator.whirlwind_last_move_log   = -1
+        wlog('channel stopped (reason=' .. tostring(reason)
+            .. ', remove_ok=' .. tostring(ok)
+            .. (ok and '' or ', err=' .. tostring(err)) .. ')')
+    end
+end
+-- Public hard-cancel for the Whirlwind channel. Used on script load to wipe
+-- any leftover channel from a previous run (channels survive script reload
+-- because the engine owns them) and from the GUI emergency-stop keybind.
+-- Unconditional — does not consult any settings or flag, just yanks it.
+navigator.whirlwind_force_stop = function ()
+    local ok, err = pcall(cast_spell.remove_channel_spell, WHIRLWIND_SPELL_ID)
+    navigator.whirlwind_channel_active  = false
+    navigator.whirlwind_last_target_pos = nil
+    navigator.whirlwind_last_player_pos = nil
+    navigator.whirlwind_last_move_log   = -1
+    navigator.whirlwind_last_repos_log  = -1
+    wlog('FORCE STOP (remove_ok=' .. tostring(ok)
+        .. (ok and '' or ', err=' .. tostring(err)) .. ')')
+end
+-- Run once on module load to clear any leftover channel from a prior session.
+navigator.whirlwind_force_stop()
+
+-- Public teardown poller for main.lua to call EVERY pulse (regardless of
+-- freeroam / long_path state). When the script is disabled or those drivers
+-- stop, try_cast_whirlwind stops being called and the engine keeps the
+-- channel alive at the long finish horizon — the bot would whirlwind forever.
+-- This poll runs the off-conditions and tears down if any apply, even when
+-- navigator.move() itself isn't running.
+navigator.whirlwind_idle_teardown = function (local_player)
+    if not navigator.whirlwind_channel_active then return end
+    -- Only HARD STOPS here. path / target absence is now spam-mode territory,
+    -- not a teardown trigger, so we don't kill Whirlwind during the brief
+    -- gaps between path legs. NOTE: not gated by settings.use_movement (see
+    -- try_cast_whirlwind comment) — Whirlwind toggle is the sole user gate.
+    if not settings.use_whirlwind
+        or navigator.disable_spell == true
+        or local_player == nil
+        or utils.player_in_town()
+        or utils.get_character_class(local_player) ~= 'barbarian'
+        or navigator.last_trav ~= nil
+        or navigator.trav_escape_pos ~= nil
+        or navigator.post_trav_target ~= nil
+        or navigator.paused == true
+        or whirlwind_external_busy() ~= nil
+    then
+        whirlwind_teardown('idle_poll')
+    end
+end
+local function try_cast_whirlwind(local_player, cur_node)
+    -- Every disable path must call teardown — otherwise the engine keeps
+    -- casting Whirlwind at the long finish horizon even after the toggle is
+    -- off (root cause: bot was whirlwinding indefinitely after disable).
+    -- HARD STOPS: real "the bot must not whirlwind" signals (in town,
+    -- Alfred/external pause, traversal/portal, class mismatch, plugin off).
+    -- These cleanly tear down so other scripts can drive movement.
+    -- NOTE: Whirlwind is intentionally NOT gated by settings.use_movement.
+    -- That master toggle controls legacy teleport-style snaps (teleport, dash,
+    -- leap, charge). Whirlwind is a channel buff that behaves like walking +
+    -- move-speed; WarPigs / ArkhamAsylum frequently flip use_movement off
+    -- when handing pit control to a non-Batmobile driver, which used to
+    -- silently kill Whirlwind in the pit even though the user wanted it on.
+    -- Diagnostic wrapper: log silent early-returns at 1Hz so we can see WHICH
+    -- gate is short-circuiting when no whirlwind activity appears in the log.
+    -- whirlwind_teardown is silent when channel was already inactive, so the
+    -- normal teardown reasons don't surface here without this.
+    local function blocked(reason)
+        whirlwind_teardown(reason)
+        local now_b = get_time_since_inject()
+        if (navigator.whirlwind_last_block_log or -1) + 1.0 < now_b then
+            navigator.whirlwind_last_block_log = now_b
+            wlog('skip reason=' .. reason)
+        end
+    end
+    if not settings.use_whirlwind then blocked('use_whirlwind_off'); return end
+    if navigator.disable_spell == true then blocked('disable_spell'); return end
+    if local_player == nil or cur_node == nil then blocked('no_player'); return end
+    if utils.player_in_town() then blocked('in_town'); return end
+    if navigator.paused == true then blocked('nav_paused'); return end
+    if utils.get_character_class(local_player) ~= 'barbarian' then
+        blocked('non_barbarian'); return
+    end
+    if navigator.last_trav ~= nil then
+        blocked('trav_pending'); return
+    end
+    if navigator.trav_escape_pos ~= nil or navigator.post_trav_target ~= nil then
+        blocked('trav_escape'); return
+    end
+    -- External plugin yield (Looteer pickup, Reaper interact tasks).
+    local ext_busy = whirlwind_external_busy()
+    if ext_busy then blocked(ext_busy); return end
+
+    -- Pick the path node at ~WHIRLWIND_TARGET_AHEAD yards of cumulative path
+    -- distance from the player. Direct-LOS picker was failing on tight
+    -- geometry (los_break=2 nearly every tick in the log) because straight
+    -- rays clip walls/pillars even when the path winds through walkable
+    -- corridors. Cumulative path distance is always reachable — the path
+    -- itself is the walkable route by construction. Whirlwind channel target
+    -- is just a direction anchor; the walking pathfinder still drives motion
+    -- around real corners.
+    local WHIRLWIND_TARGET_AHEAD = 8.0
+    -- MIN_PATH separates channel-mode from spam-mode. With a long enough
+    -- remaining path we use the engine's add_channel_spell (smooth, low
+    -- input contention). When the path is shorter we fall through to spam
+    -- mode below (direct cast_spell.position each tick) so we don't lose
+    -- the Whirlwind buff/move-speed bonus on the final approach.
+    local WHIRLWIND_MIN_PATH     = WHIRLWIND_TARGET_AHEAD
+    local target_node, total_path, extended_idx
+    if #navigator.path > 0 then
+        target_node       = navigator.path[1]
+        total_path        = utils.distance(cur_node, navigator.path[1])
+        local cumulative  = total_path
+        extended_idx      = 1
+        local target_locked = false
+        for i = 2, #navigator.path do
+            local node      = navigator.path[i]
+            local prev_node = navigator.path[i - 1]
+            local seg       = utils.distance(prev_node, node)
+            total_path      = total_path + seg
+            if not target_locked then
+                target_node    = node
+                extended_idx   = i
+                cumulative     = cumulative + seg
+                if cumulative >= WHIRLWIND_TARGET_AHEAD then target_locked = true end
+            end
+        end
+    else
+        target_node  = navigator.whirlwind_last_target_pos or cur_node
+        total_path   = 0
+        extended_idx = 0
+    end
+
+    -- SPAM MODE: short-path tail OR between-legs gap. We tear down the engine
+    -- channel registration (it would lock onto a stale point) and instead
+    -- call cast_spell.position every tick toward the path end (or last known
+    -- target if path is empty). User explicitly requested this over teardown:
+    -- "we lose buffs and movement speed bonuses when we stop to walk the last
+    -- few units." Stuttery is acceptable; lost buffs are not.
+    if total_path < WHIRLWIND_MIN_PATH then
+        if navigator.whirlwind_channel_active then
+            pcall(cast_spell.remove_channel_spell, WHIRLWIND_SPELL_ID)
+            navigator.whirlwind_channel_active  = false
+            navigator.whirlwind_last_target_pos = nil
+        end
+        local spam_target = target_node
+        if spam_target == nil or #navigator.path == 0 then
+            -- Between-legs: spam in current position to keep the channel buff
+            -- alive without sending the character backward.
+            spam_target = cur_node
+        end
+        pcall(cast_spell.position, WHIRLWIND_SPELL_ID, spam_target, 0)
+        local now_s = get_time_since_inject()
+        if (navigator.whirlwind_last_spam_log or -1) + 1.0 < now_s then
+            navigator.whirlwind_last_spam_log = now_s
+            wlog(string.format('spam path=%d total=%.1f tgt=%s',
+                #navigator.path, total_path, utils.vec_to_string(spam_target)))
+        end
+        return
+    end
+    local target_dist   = utils.distance(cur_node, target_node)
+    local los_break_idx = nil  -- retained for log compat; cumulative picker doesn't LOS-check
+    if target_node == nil then
+        whirlwind_teardown('nil_target')
+        return
+    end
+
+    -- Movement detection: how far did the player travel since last tick?
+    -- If we're channeling but not moving, we know the cast isn't translating
+    -- the character (vs. e.g. the channel never registered).
+    local now = get_time_since_inject()
+    local moved = -1
+    if navigator.whirlwind_last_player_pos ~= nil then
+        moved = utils.distance(cur_node, navigator.whirlwind_last_player_pos)
+    end
+    navigator.whirlwind_last_player_pos = cur_node
+
+    -- Detect external teardown (death, town port, etc.) and re-register if needed.
+    local engine_active = navigator.whirlwind_channel_active
+    local probed = false
+    if engine_active and type(cast_spell.is_channel_spell_active) == 'function' then
+        probed = true
+        local ok_q, val = pcall(cast_spell.is_channel_spell_active, WHIRLWIND_SPELL_ID)
+        if ok_q then engine_active = val and true or false end
+    end
+
+    -- Throttled diagnostic line (~1Hz) so the console isn't flooded.
+    if (navigator.whirlwind_last_move_log or -1) + 1.0 < now then
+        navigator.whirlwind_last_move_log = now
+        wlog(string.format(
+            'tick path=%d ext_idx=%d/%d los_break=%s tgt_dist=%.1f moved=%.2f channel_flag=%s engine_active=%s probed=%s',
+            #navigator.path, extended_idx, #navigator.path,
+            tostring(los_break_idx),
+            target_dist, moved,
+            tostring(navigator.whirlwind_channel_active),
+            tostring(engine_active), tostring(probed)))
+    end
+
+    if not navigator.whirlwind_channel_active or not engine_active then
+        local interval = settings.whirlwind_cooldown or 0.1
+        -- animation_time = 0 (non-blocking). Per wiki: animation_time "will
+        -- block other actions like movement inputs" — with 0.1 here at a 0.1s
+        -- interval we were 100%-blocking the walking pathfinder's request_move
+        -- calls, which explains the 0.5y/sec movement in the log (slower than
+        -- walking baseline). The channel still registers; the walking
+        -- pathfinder remains free to drive translation while whirlwind is up.
+        local anim_time = 0
+        local ok, err = pcall(function ()
+            cast_spell.add_channel_spell(
+                WHIRLWIND_SPELL_ID,
+                now,
+                now + WHIRLWIND_FINISH,
+                nil,           -- no unit target; ground-cast only
+                target_node,   -- cast_position
+                anim_time,
+                interval)
+        end)
+        wlog(string.format(
+            'add_channel_spell ok=%s err=%s tgt=%s tgt_dist=%.1f anim=%.2f interval=%.2f',
+            tostring(ok), tostring(err), utils.vec_to_string(target_node),
+            target_dist, anim_time, interval))
+        if ok then
+            navigator.whirlwind_channel_active  = true
+            navigator.whirlwind_last_target_pos = target_node
+        end
+    else
+        -- Only push position updates when target has drifted enough that the
+        -- channel target is meaningfully stale. Each call appears to briefly
+        -- contend with walking input — keep updates rare (REPOS_DIST tuned to
+        -- match the picker's TARGET_AHEAD so one update per advance zone).
+        local last = navigator.whirlwind_last_target_pos
+        if last == nil or utils.distance(last, target_node) > WHIRLWIND_REPOS_DIST then
+            local ok = pcall(cast_spell.update_channel_spell_position,
+                WHIRLWIND_SPELL_ID, target_node)
+            navigator.whirlwind_last_target_pos = target_node
+            -- Throttle log to ~1Hz (matches tick log cadence); reposition was
+            -- firing dozens of times per second and flooding the console.
+            if (navigator.whirlwind_last_repos_log or -1) + 1.0 < now then
+                navigator.whirlwind_last_repos_log = now
+                wlog(string.format('reposition ok=%s -> %s dist=%.1f',
+                    tostring(ok), utils.vec_to_string(target_node), target_dist))
+            end
+        end
+    end
 end
 local get_movement_spell_id = function(local_player)
     if not settings.use_movement then
@@ -814,6 +1195,43 @@ navigator.update = function ()
     explorer.update(local_player)
     tracker.bench_stop("nav_explorer_update")
 end
+-- update_lite: A*-only variant. Skips the frontier scan / eviction / visited-cell
+-- maintenance in explorer.update() AND skips the backtrack append in
+-- explorer.set_current_pos(). Use when the caller drives Batmobile to a known
+-- target via set_target + pause and never relies on exploration discovery or
+-- backtrack history (e.g. HordeDev). cur_pos/prev_pos are still refreshed so
+-- movement/pathfinder code reads a current position.
+navigator.update_lite = function ()
+    if navigator.update_time + navigator.update_timeout > get_time_since_inject() then
+        tracker.bench_count("update_lite_skipped_throttle")
+        return
+    end
+    navigator.update_time = get_time_since_inject()
+    tracker.bench_count("update_lite_ran")
+    local local_player = get_local_player()
+    if not local_player then return end
+    if has_traversal_buff(local_player) then
+        tracker.bench_count("update_lite_skipped_buff")
+        return
+    end
+    if explorer.cur_pos ~= nil and
+        (navigator.trav_delay == nil or get_time_since_inject() > navigator.trav_delay)
+    then
+        local jump_dist = utils.distance(local_player:get_position(), explorer.cur_pos)
+        if jump_dist > 50 then
+            dlog('[nav] respawn detected (jumped ' .. string.format('%.1f', jump_dist) .. ' units), resuming from last backtrack point')
+            explorer.backtracking = true
+            navigator.target = nil
+            navigator.is_custom_target = false
+            navigator.path = {}
+            navigator.trav_final_target = nil
+            navigator.failed_target = nil
+        end
+    end
+    explorer.prev_pos = explorer.cur_pos
+    explorer.cur_pos = utils.normalize_node(local_player:get_position())
+end
+
 -- reset_movement: clears only movement/pathfinding state; preserves explorer's
 -- visited/backtrack/frontier so long-session exploration is not lost.
 -- Use this for mid-session interruptions (death, stuck, traversal recovery).
@@ -1693,6 +2111,10 @@ navigator.move = function ()
         end
     end
     tracker.bench_stop("nav_move_spell")
+
+    -- Whirlwind tick: independent of get_movement_spell_id / move_spell block.
+    -- Pure spell cast on cadence; does not modify path or any movement state.
+    try_cast_whirlwind(local_player, cur_node)
 
     local update_timeout = 1
     if utils.player_in_town() then update_timeout = 10 end

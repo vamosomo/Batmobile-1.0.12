@@ -60,6 +60,8 @@ gui.elements = {
     use_leap = create_checkbox(true, "use_leap"),
     use_charge = create_checkbox(true, "use_charge"),
     use_whirlwind = create_checkbox(false, "use_whirlwind"),
+    whirlwind_cooldown = slider_float:new(0.05, 10.0, 0.1, get_hash(plugin_label .. '_whirlwind_cooldown')),
+    whirlwind_force_stop_keybind = keybind:new(0x0A, true, get_hash(plugin_label .. '_whirlwind_force_stop_keybind')),
     use_advance = create_checkbox(true, "use_advance"),
     use_falling_star = create_checkbox(true, "use_falling_star"),
     use_aoj = create_checkbox(true, "use_aoj"),
@@ -140,6 +142,23 @@ local function _mvr_hash(suffix)
     return get_hash(plugin_label .. '_mvr_' .. suffix)
 end
 
+-- input_text:render needs 5 args; if it crashes the host kills the game.
+-- Mirror UR's _safe_input_render: wrap in pcall, rebuild widget with a fresh
+-- hash on failure so the next frame starts clean instead of repeating the error.
+local _input_gen = {}
+local function _safe_input_render(field_key, label, tooltip)
+    local el = gui.elements[field_key]
+    if not el then return end
+    local ok = pcall(function()
+        el:render(label, tooltip, false, '', '')
+    end)
+    if not ok then
+        _input_gen[field_key] = (_input_gen[field_key] or 0) + 1
+        local fresh = get_hash(plugin_label .. '_' .. field_key .. '_g' .. _input_gen[field_key])
+        gui.elements[field_key] = input_text:new(fresh)
+    end
+end
+
 gui.elements.mvr_enabled  = checkbox:new(false, _mvr_hash('enabled'))
 gui.elements.mvr_tree     = tree_node:new(0)
 gui.elements.mvr_active_rule_count = slider_int:new(0, mrul.MAX_RULES, 0, _mvr_hash('active_rule_count'))
@@ -214,10 +233,8 @@ function gui.render_profiles()
     if names and #names > 0 then
         gui.elements.profile_combo:render('Profile', names,
             'Switch between saved Movement Revamp profiles. Switching auto-saves the current one.')
-        pcall(function()
-            gui.elements.profile_rename:render('Rename profile',
-                'Type a new name for the active profile, then click Apply Rename.')
-        end)
+        _safe_input_render('profile_rename', 'Rename Profile',
+            'Type a new name for the active profile, then click Apply Rename.')
         gui.elements.profile_rename_btn:render('Apply Rename',
             'Apply the name typed above to the active profile.')
         gui.elements.new_profile:render('New Profile (copy current)',
@@ -408,9 +425,20 @@ function gui.render()
             gui.elements.use_leap:render('leap', 'use leap for movement')
             gui.elements.use_charge:render('charge', 'use charge for movement')
             gui.elements.use_whirlwind:render('whirlwind',
-                'Use Whirlwind for movement. Fires via repeated position-casts toward the\n' ..
-                'next path node. Path and replan cooldown are preserved between casts so\n' ..
-                'the spin runs continuously without walking gaps.')
+                'Channel Whirlwind while walking for faster traversal.\n' ..
+                'Unlike teleport/leap/charge this does NOT snap the player to a far node —\n' ..
+                'the normal walking path is preserved; Whirlwind is registered as a channel\n' ..
+                'spell (cast_spell.add_channel_spell) so the engine keeps the channel up\n' ..
+                'while we just update its target position to the next path node each tick.')
+            if gui.elements.use_whirlwind:get() then
+                gui.elements.whirlwind_cooldown:render('  whirlwind channel interval (sec)',
+                    'Channel re-cast interval handed to cast_spell.add_channel_spell.\n' ..
+                    'Lower = more frequent re-issue (smoother channel). Default 0.1s.', 1)
+            end
+            gui.elements.whirlwind_force_stop_keybind:render('  EMERGENCY stop whirlwind channel',
+                'Hard-removes the Whirlwind channel from the engine immediately.\n' ..
+                'Use when the channel is stuck running and the bot is rooted in place\n' ..
+                '(e.g. after a script reload or unexpected state).')
         elseif class == 'paladin' then
             gui.elements.use_advance:render('advance', 'use advance for movement')
             gui.elements.use_falling_star:render('falling star', 'use falling star for movement')

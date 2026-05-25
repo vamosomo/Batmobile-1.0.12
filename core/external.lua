@@ -68,7 +68,10 @@ external.move = function (caller)
     tracker.bench_stop("total_move")
     tracker.bench_report()
 end
-external.update = function (caller)
+-- update: pass lite=true to skip the frontier scan / eviction overhead when the
+-- caller is driving Batmobile to a known target and doesn't need exploration
+-- discovery this tick. A* / pathfinding / movement are unaffected.
+external.update = function (caller, lite)
     if caller == nil then
         utils.log(2,'update called with no caller')
         return
@@ -77,7 +80,11 @@ external.update = function (caller)
     utils.log(2, 'update called by ' .. tostring(caller))
     tracker.bench_start("total_update")
     local start_update = os.clock()
-    navigator.update()
+    if lite then
+        navigator.update_lite()
+    else
+        navigator.update()
+    end
     tracker.timer_update = os.clock() - start_update
     tracker.bench_stop("total_update")
 end

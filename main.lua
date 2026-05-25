@@ -17,6 +17,12 @@ local mvr_profile  = require 'core.mvr_profile'
 -- Load saved profile on script start (reads manifest + active profile from disk).
 mvr_profile.init()
 
+-- Safely calls :set() on any widget (mirrors UR's _set_element pattern).
+local function _set_el(el, val)
+    if not el or val == nil then return end
+    if type(el.set) == 'function' then pcall(el.set, el, val) end
+end
+
 local local_player
 local debounce_time = nil
 local debounce_timeout = 1
@@ -33,11 +39,39 @@ local function update_locals()
 end
 
 local function main_pulse()
-    -- Profile system: keep GUI state in sync and handle button presses.
-    -- Runs before the loading guard so the menu stays responsive while loading.
+    -- Profile system: mirrors UR's handle_profile_io pattern.
+    -- gui is a direct top-level local here (not require'd inside a handler),
+    -- which is why button clicks register reliably — same as UR.
     gui.profile_names  = mvr_profile.get_profile_names()
     gui.active_profile = mvr_profile.get_active_profile()
-    mvr_profile.handle_io()
+
+    if gui.elements.new_profile and gui.elements.new_profile:get() then
+        mvr_profile.create_new()
+        _set_el(gui.elements.profile_combo, mvr_profile.get_active_index())
+        gui.elements.new_profile:set(false)
+    end
+
+    if gui.elements.delete_profile and gui.elements.delete_profile:get() then
+        mvr_profile.delete()
+        _set_el(gui.elements.profile_combo, mvr_profile.get_active_index())
+        gui.elements.delete_profile:set(false)
+    end
+
+    if gui.elements.profile_rename_btn and gui.elements.profile_rename_btn:get() then
+        gui.elements.profile_rename_btn:set(false)
+        local rename_el = gui.elements.profile_rename
+        local new_name = ''
+        if rename_el and type(rename_el.get) == 'function' then
+            local ok, v = pcall(rename_el.get, rename_el)
+            if ok and type(v) == 'string' then new_name = v end
+        end
+        if new_name ~= '' then
+            mvr_profile.rename(new_name)
+            _set_el(gui.elements.profile_combo, mvr_profile.get_active_index())
+        end
+    end
+
+    mvr_profile.handle_io()  -- combo switching + autosave
 
     if utils.player_loading() then
         -- extend last_update so unstuck doesn't fire right after loading
@@ -57,6 +91,14 @@ local function main_pulse()
         long_nav.stop('reset_keybind')
         navigator.reset()
         map.reset()
+    end
+    -- Emergency hard-stop for the Whirlwind channel. Bypasses every gate;
+    -- yanks the channel from the engine directly. For debug / unsticking.
+    if gui.elements.whirlwind_force_stop_keybind:get_state() == 1 then
+        gui.elements.whirlwind_force_stop_keybind:set(false)
+        if navigator.whirlwind_force_stop then
+            navigator.whirlwind_force_stop()
+        end
     end
     if gui.elements.long_path_set_target:get_state() == 1 then
         gui.elements.long_path_set_target:set(false)
@@ -176,6 +218,13 @@ local function main_pulse()
         local start_move = os.clock()
         navigator.move()
         tracker.timer_move = os.clock() - start_move
+    end
+    -- Run unconditionally so the Whirlwind channel is torn down even when no
+    -- navigation driver is active (freeroam off, long_path idle, plugin
+    -- disabled via use_movement). Otherwise the engine keeps casting at the
+    -- long finish horizon and the bot whirlwinds in place forever.
+    if navigator.whirlwind_idle_teardown then
+        navigator.whirlwind_idle_teardown(local_player)
     end
 end
 

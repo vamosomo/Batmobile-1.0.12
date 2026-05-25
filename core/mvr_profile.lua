@@ -5,6 +5,7 @@
 
 local profile_io = require 'core.profile_io'
 local mrul       = require 'core.movement_rules'
+local mhelp      = require 'core.movement_helpers'
 
 local M = {}
 
@@ -118,11 +119,20 @@ local function _build_data(name)
             for c = 1, mrul.MAX_CONDITIONS_PER_RULE do
                 local cw = rw.cond_widgets and rw.cond_widgets[c]
                 if cw then
+                    -- Resolve buff_hash from combo when the slider was never
+                    -- explicitly set. This means picking a buff from the combo
+                    -- dropdown is enough — the hash is captured at autosave time
+                    -- and persists correctly across logins and characters.
+                    local bh = cw.buff_hash:get() or 0
+                    if bh == 0 then
+                        local bc_idx = cw.buff_combo:get() or 0
+                        bh = mhelp.buff_hash_for_combo_index(bc_idx) or 0
+                    end
                     rd.conditions[c] = {
                         combinator = cw.combinator:get() or 0,
                         type       = cw.type:get()       or 0,
                         buff_combo = cw.buff_combo:get() or 0,
-                        buff_hash  = cw.buff_hash:get()  or 0,
+                        buff_hash  = bh,
                         op         = cw.op:get()         or 0,
                         value      = cw.value:get()      or 0,
                         radius     = cw.radius:get()     or 6,
@@ -161,13 +171,29 @@ local function _apply_data(data)
                 local cw = rw.cond_widgets and rw.cond_widgets[c]
                 local cd = conds[c]
                 if cw and cd then
-                    _set_el(cw.combinator,  cd.combinator)
-                    _set_el(cw.type,        cd.type)
-                    _set_el(cw.buff_combo,  cd.buff_combo)
-                    _set_el(cw.op,          cd.op)
+                    _set_el(cw.combinator, cd.combinator)
+                    _set_el(cw.type,       cd.type)
+                    _set_el(cw.op,         cd.op)
                     _rsl_int(cw, 'buff_hash', 0, 1073741823, cd.buff_hash)
                     _rsl_int(cw, 'value',     0, 100,        cd.value)
                     _rsl_int(cw, 'radius',    1, 20,         cd.radius)
+                    -- Restore the combo to the correct catalog position for the
+                    -- saved hash. Seed first so the entry always exists, then
+                    -- find its index — this way the combo shows the real buff name
+                    -- rather than "(unused N)" regardless of catalog observation order.
+                    if cd.buff_hash and cd.buff_hash > 0 then
+                        mhelp.seed_buff_hash(cd.buff_hash)
+                        local combo_idx = 0
+                        for idx, entry in ipairs(mhelp.known_buffs_ordered) do
+                            if entry.hash == cd.buff_hash then
+                                combo_idx = idx  -- catalog[idx] maps to combo index idx
+                                break
+                            end
+                        end
+                        _set_el(cw.buff_combo, combo_idx)
+                    else
+                        _set_el(cw.buff_combo, cd.buff_combo)
+                    end
                 end
             end
         end
@@ -306,36 +332,12 @@ function M.init()
     _log('Ready. Active: ' .. _active_profile)
 end
 
--- Call every tick from main_pulse.
+-- Call every tick from main_pulse. Handles combo switching and autosave only.
+-- Button clicks (New / Delete / Rename) are handled in main.lua directly,
+-- mirroring UR's pattern of reading gui.elements from the top-level module
+-- rather than from inside a require'd module.
 function M.handle_io()
     local gui = require 'gui'
-
-    if gui.elements.new_profile and gui.elements.new_profile:get() then
-        gui.elements.new_profile:set(false)
-        _create_new()
-        _last_profile_idx = _get_active_index()
-        _set_el(gui.elements.profile_combo, _last_profile_idx)
-    end
-
-    if gui.elements.delete_profile and gui.elements.delete_profile:get() then
-        gui.elements.delete_profile:set(false)
-        _delete()
-        _last_profile_idx = _get_active_index()
-        _set_el(gui.elements.profile_combo, _last_profile_idx)
-    end
-
-    if gui.elements.profile_rename_btn and gui.elements.profile_rename_btn:get() then
-        gui.elements.profile_rename_btn:set(false)
-        local el = gui.elements.profile_rename
-        if el and type(el.get) == 'function' then
-            local ok, v = pcall(el.get, el)
-            if ok and type(v) == 'string' and v ~= '' then
-                _rename(v)
-                _last_profile_idx = _get_active_index()
-                _set_el(gui.elements.profile_combo, _last_profile_idx)
-            end
-        end
-    end
 
     if gui.elements.profile_combo then
         local sel = gui.elements.profile_combo:get()
@@ -351,7 +353,24 @@ function M.handle_io()
     _autosave()
 end
 
-function M.get_profile_names()  return _profile_names  end
-function M.get_active_profile() return _active_profile end
+-- Individual profile operations called directly from main.lua.
+function M.create_new()
+    _create_new()
+    _last_profile_idx = _get_active_index()
+end
+
+function M.delete()
+    _delete()
+    _last_profile_idx = _get_active_index()
+end
+
+function M.rename(new_name)
+    _rename(new_name)
+    _last_profile_idx = _get_active_index()
+end
+
+function M.get_active_index()   return _get_active_index()  end
+function M.get_profile_names()  return _profile_names       end
+function M.get_active_profile() return _active_profile      end
 
 return M
